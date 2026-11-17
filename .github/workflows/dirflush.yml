@@ -1,0 +1,136 @@
+name: dirflush
+on:
+  push:
+    branches: [dirflush]
+  workflow_dispatch:
+jobs:
+  windows:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dirflush
+
+      - name: build (mingw gcc)
+        shell: pwsh
+        run: |
+          Set-Location libraries/liblmdb
+          gcc --version | Select-Object -First 1
+          gcc -O2 -I. -o dirsync.exe dirsync-test.c mdb.c midl.c
+          gcc -O2 -I. -DMDB_DIRSYNC_PROBE -o dirsync-probe.exe dirsync-test.c mdb.c midl.c
+          gcc -O2 -I. -o race.exe race-test.c mdb.c midl.c
+          gcc -O2 -I. -o bench-dirroot.exe e25_lmdb_bench.c mdb.c midl.c
+          Copy-Item mdb-base.c mdb.c -Force
+          gcc -O2 -I. -o dirname-base.exe dirname-test.c midl.c
+          gcc -O2 -I. -o bench-base.exe e25_lmdb_bench.c mdb.c midl.c
+          Copy-Item mdb-dir.c mdb.c -Force
+          gcc -O2 -I. -o dirname-dir.exe dirname-test.c midl.c
+          gcc -O2 -I. -o bench-dir.exe e25_lmdb_bench.c mdb.c midl.c
+          Copy-Item mdb-dirroot.c mdb.c -Force
+
+      - name: unit tests (dirname, three variants - all must pass)
+        shell: pwsh
+        run: |
+          Set-Location libraries/liblmdb
+          dirname-base.exe
+          dirname-dir.exe
+          dirname-dirroot.exe
+
+      - name: functional tests (env + copy in all modes)
+        shell: pwsh
+        run: |
+          Set-Location libraries/liblmdb
+          New-Item -ItemType Directory -Force -Path D:\dirt, D:\dirt\nosub | Out-Null
+          dirsync.exe D:\dirt\a D:\dirt\b normal
+          dirsync.exe D:\dirt\c D:\dirt\d nosubdir
+          dirsync.exe D:\dirt\e D:\dirt\f nosync
+          dirsync.exe D:\dirt\nosub\g D:\dirt\nosub\h nosubdir-nosync
+
+      - name: green side - probe shows dir flush AND root flush (root_err=0)
+        shell: pwsh
+        run: |
+          Set-Location libraries/liblmdb
+          New-Item -ItemType Directory -Force -Path D:\dirt\probe | Out-Null
+          $out = dirsync-probe.exe D:\dirt\probe\a D:\dirt\probe\b normal 2>&1 | Out-String
+          $out | Write-Host
+          $dir = ($out | Select-String 'DIRSYNC-PROBE dir=.*open_err=0 flush_err=0').Count
+          $root = ($out | Select-String 'DIRSYNC-PROBE-ROOT dir=.*root_err=0').Count
+          Write-Host "dir-flush lines: $dir, root-flush lines: $root"
+          if ($dir -lt 1 -or $root -lt 1) { exit 1 }
+
+      - name: red side - pristine build prints no probe lines at all
+        shell: pwsh
+        run: |
+          Set-Location libraries/liblmdb
+          gcc -O2 -I. -DMDB_DIRSYNC_PROBE -o dirsync-base.exe dirsync-test.c mdb-base.c midl.c
+          New-Item -ItemType Directory -Force -Path D:\dirt\red | Out-Null
+          $out = dirsync-base.exe D:\dirt\red\a D:\dirt\red\b normal 2>&1 | Out-String
+          $out | Write-Host
+          $n = ($out | Select-String 'DIRSYNC-PROBE').Count
+          Write-Host "probe lines on pristine: $n"
+          if ($n -ne 0) { exit 1 }
+
+      - name: race test (informational, counts the documented limitation)
+        shell: pwsh
+        run: |
+          Set-Location libraries/liblmdb
+          New-Item -ItemType Directory -Force -Path D:\dirt\ra, D:\dirt\rb | Out-Null
+          race.exe D:\dirt\ra D:\dirt\rb 2000
+
+      - name: bench - env creation + commit cost, three variants (3 rounds)
+        shell: pwsh
+        run: |
+          Set-Location libraries/liblmdb
+          foreach ($r in 1..3) {
+            bench-base.exe D:\dirt\bench 100 2000 base
+            bench-dir.exe D:\dirt\bench 100 2000 dir
+            bench-dirroot.exe D:\dirt\bench 100 2000 dirroot
+          }
+
+  linux:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: dirflush
+
+      - name: build
+        run: |
+          cd libraries/liblmdb
+          gcc --version | head -1
+          gcc -O2 -I. -o dirsync-linux dirsync-test.c mdb.c midl.c
+          gcc -O2 -I. -o dirname-linux dirname-test.c midl.c
+          gcc -O2 -I. -o bench-dirroot-linux e25_lmdb_bench.c mdb.c midl.c
+          cp mdb-base.c mdb.c
+          gcc -O2 -I. -o dirname-base-linux dirname-test.c midl.c
+          gcc -O2 -I. -o bench-base-linux e25_lmdb_bench.c mdb.c midl.c
+          cp mdb-dir.c mdb.c
+          gcc -O2 -I. -o dirname-dir-linux dirname-test.c midl.c
+          gcc -O2 -I. -o bench-dir-linux e25_lmdb_bench.c mdb.c midl.c
+          cp mdb-dirroot.c mdb.c
+
+      - name: unit tests (three variants)
+        run: |
+          cd libraries/liblmdb
+          ./dirname-base-linux && ./dirname-dir-linux && ./dirname-dirroot-linux
+
+      - name: green side - strace shows fsync on a directory fd
+        run: |
+          cd libraries/liblmdb
+          mkdir -p /tmp/dirt/g
+          strace -f -e trace=fsync,fdatasync,openat ./dirsync-linux /tmp/dirt/g/a /tmp/dirt/g/b > /dev/null 2> strace.out || true
+          cat strace.out | grep -c "fsync" | head -1
+          # a directory fsync must appear (fd opened via openat with O_RDONLY|O_DIRECTORY)
+          grep -E 'fsync\(' strace.out | head -5
+
+      - name: bench (linux side, same three variants)
+        run: |
+          cd libraries/liblmdb
+          mkdir -p /tmp/dirt/bench
+          for r in 1 2 3; do
+            ./bench-base-linux /tmp/dirt/bench 100 2000 base
+            ./bench-dir-linux /tmp/dirt/bench 100 2000 dir
+            ./bench-dirroot-linux /tmp/dirt/bench 100 2000 dirroot
+          done

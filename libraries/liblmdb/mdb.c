@@ -5343,6 +5343,343 @@ mdb_fname_init(const char *path, unsigned envflags, MDB_name *fname)
 # define MDB_CLOEXEC		0
 #endif
 
+/** Directory portion of \b path: everything before the last directory
+ * separator, or "." if the path has none.  malloced; caller frees.
+ *
+ * '\\' is an ordinary character in POSIX file names, so it separates path
+ * components only on Windows.  Trailing separators are ignored on both.
+ * A Windows drive-relative name ("C:data.mdb") yields "C:", which
+ * mdb_mdirsync() resolves against the per-drive current directory.
+ */
+static char * ESECT
+mdb_dirname(const char *path)
+{
+	size_t len = strlen(path);
+	const char *sep = NULL, *p;
+	char *dir;
+#ifdef _WIN32
+#define MDB_DIRSEP(c)	((c) == '/' || (c) == '\\')
+#else
+#define MDB_DIRSEP(c)	((c) == '/')
+#endif
+
+	while (len && MDB_DIRSEP(path[len-1]))
+		len--;
+	for (p = path; p < path + len; p++)
+		if (MDB_DIRSEP(*p))
+			sep = p;
+	if (!sep) {
+#ifdef _WIN32
+		if (path[0] && path[1] == ':') {
+			dir = malloc(3);
+			if (dir) {
+				dir[0] = path[0];
+				dir[1] = ':';
+				dir[2] = '\0';
+			}
+		} else
+#endif
+		{
+			dir = malloc(2);
+			if (dir)
+				strcpy(dir, ".");
+		}
+	} else {
+		size_t dlen = (size_t)(sep - path);
+		size_t off = 0;
+		if (!dlen)
+			dlen = 1;	/* "/file" -> "/" */
+#ifndef _WIN32
+		if (path[0] == '/') {
+			/* POSIX: exactly two leading slashes are
+			 * implementation-defined -- keep them; three or more must
+			 * collapse to one.  The dirname may end inside the run
+			 * ("//file" -> "//") or extend past it ("///dir/file" ->
+			 * "/dir"). */
+			size_t leading = 0;
+			while (leading < len && path[leading] == '/')
+				leading++;
+			if (leading >= 2) {
+				if (leading > 2) {
+					if (dlen <= leading) {
+						dlen = 1;
+						off = 0;
+					} else {
+						off = leading - 1;
+						dlen -= off;
+					}
+				} else if (dlen == 1) {
+					dlen = 2;
+					off = 0;
+				}
+			}
+		}
+#else
+		if (dlen == 2 && path[1] == ':')
+			dlen = 3;	/* "C:\db.mdb" -> "C:\" -- its parent is the
+					 * drive root, not the drive's cwd */
+		else if (dlen == 6 && path[0] == '\\' && path[1] == '\\' &&
+			(path[2] == '?' || path[2] == '.') && path[3] == '\\' &&
+			path[5] == ':')
+			dlen = 7;	/* "\\?\C:\db.mdb" -> "\\?\C:\" and
+					 * "\\.\C:\db.mdb" -> "\\.\C:\" -- the
+					 * separator IS the seventh char */
+#endif
+		dir = malloc(dlen + 1);
+		if (dir) {
+			memcpy(dir, path + off, dlen);
+			dir[dlen] = '\0';
+		}
+	}
+#undef MDB_DIRSEP
+	return dir;
+}
+
+#ifdef MDB_DIRSYNC_PROBE
+#include <stdio.h>
+#endif
+
+/** Flush a directory so that entries of files just created or renamed in it
+ * are durable.
+ *
+ * POSIX: open the directory and fsync() it.  On Apple platforms try
+ * F_FULLFSYNC first (what LMDB already uses for data files); F_FULLFSYNC on
+ * a directory descriptor is not documented anywhere, so if the kernel
+ * rejects it fall back to fsync() and accept the weaker guarantee.
+ *
+ * Windows: CreateFileW() accepts relative names, forward slashes,
+ * drive-relative names ("C:dir"), and \?\ extended paths directly, so the
+ * name mdb_dirname() produced is handed over as-is.  The one form it cannot
+ * open is the bare drive "C:" (also what mdb_dirname() yields for
+ * "C:data.mdb"): it is resolved once with GetFullPathNameW(), starting from
+ * a 32 KiW buffer; if the drive's current directory changed in between and
+ * the buffer turned out too small (GetFullPathNameW then returns the
+ * required size including the NUL), retry once with that size and give up
+ * past 64 KiW.  NTFS implements the directory flush (MS-FSA 2.1.5.7, product
+ * note <80>) and it works without administrator rights, but Microsoft
+ * documents neither FlushFileBuffers nor "Directory Handles" as accepting a
+ * directory handle: there is no Win32 contract for it, and other file
+ * systems may return success without persisting the namespace entry.
+ * Success here is best effort.
+ *
+ * Limitation shared with LMDB itself: for a relative path, LMDB resolves the
+ * data file, the lock file and this directory against the current directory
+ * at three different moments, so a concurrent SetCurrentDirectory() on
+ * another thread can make any of them land in a different directory; this
+ * patch adds one more resolution of the same kind and does not pretend to
+ * fix the race.  Resolving the path once before opening is the complete fix
+ * and belongs to upstream.  Absolute paths (the usual form for a database)
+ * are immune.
+ *
+ * Filesystems that cannot flush directories are tolerated where the error
+ * says so (POSIX EINVAL/ENOTSUP/ENOSYS; Windows ERROR_NOT_SUPPORTED/
+ * ERROR_INVALID_FUNCTION/ERROR_WRITE_PROTECT), keeping the pre-change
+ * behaviour there.  Access errors (EACCES/EPERM/EROFS, ERROR_ACCESS_DENIED)
+ * are tolerated too: a directory can be writable enough to create files in
+ * yet refuse a GENERIC_WRITE handle for this user -- volume roots ("C:\",
+ * "\\?\C:\") behave exactly like that for a non-admin, and so can ACLed
+ * directories -- and failing the open would be worse than the old behaviour.
+ *
+ * The directory flush alone does not make a namespace change durable on
+ * NTFS: block-command tracing (QEMU blklogwrites, E17) and ETW flush traces
+ * on real Windows kernels (E21, GitHub Actions runners) measured that
+ * FlushFileBuffers() on a subdirectory handle issues the disk flush IRP but
+ * writes no metadata -- the file's MFT record and the directory index stay
+ * in memory -- while FlushFileBuffers() on the volume root ("X:\") issues
+ * the same IRP and persists that metadata.  mdb_mdirsync() therefore also
+ * flushes the volume root of the resolved path (mdb_wflushroot() below),
+ * best effort with the same tolerance policy, skipped for paths without a
+ * drive prefix (UNC shares) and when the directory being flushed IS the
+ * root.  A root that refuses GENERIC_WRITE keeps the old behaviour through
+ * the same tolerance list as above; on the volumes tested so far (GitHub
+ * Actions runners, real Windows 10/11) it opens and flushes without
+ * elevation.
+ */
+/** Flush the volume root ("X:\\") of a resolved absolute wide path.
+ * On NTFS this is the flush that persists namespace metadata: the
+ * subdirectory flush issues the same flush IRP but writes no metadata
+ * (see the comment at the top of mdb_mdirsync).  Best effort: returns a
+ * Win32 error code, 0 on success or when there is nothing to flush
+ * (no drive prefix, or the flushed directory IS the root). */
+static DWORD
+mdb_wflushroot(const wchar_t *target)
+{
+	const wchar_t *drv = NULL;
+	wchar_t root[4];
+	HANDLE h;
+	DWORD err = 0;
+	if (target[0] == '\\' && target[1] == '\\' && target[2] == '?' &&
+		target[3] == '\\' && target[4] && target[5] == ':')
+		drv = target + 4;	/* "\\?\C:\..." -- the drive letter is
+					 * past the "\\?\" prefix */
+	else if (target[0] && target[1] == ':')
+		drv = target;		/* "C:\..." */
+	if (!drv || (drv[2] == '\\' && drv[3] == '\0'))
+		return 0;
+	root[0] = drv[0];
+	root[1] = ':';
+	root[2] = '\\';
+	root[3] = '\0';
+	h = CreateFileW(root, GENERIC_WRITE,
+		FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+		NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+	if (h == INVALID_HANDLE_VALUE)
+		return ErrCode();
+	if (!FlushFileBuffers(h))
+		err = ErrCode();
+	CloseHandle(h);
+	return err;
+}
+
+static int ESECT
+mdb_mdirsync(const char *dir)
+{
+	int rc = MDB_SUCCESS;
+#ifdef _WIN32
+	HANDLE h;
+	DWORD root_err;
+	MDB_name wname;
+	wchar_t *resolved = NULL;
+	wchar_t *target;
+	if ((rc = utf8_to_utf16(dir, &wname, 0)) != MDB_SUCCESS)
+		return rc;
+	target = wname.mn_val;
+	if (dir[0] && dir[1] == ':' && dir[2] == '\0') {
+		/* A bare "C:" names the current directory of that drive;
+		 * CreateFileW refuses it (ACCESS_DENIED), so resolve it first.
+		 * The buffer starts at 32 KiW; when GetFullPathNameW reports it
+		 * was too small (the drive's current directory changed in
+		 * between and the name no longer fits), retry once with the
+		 * returned size. */
+		DWORD need = 32768, got;
+		for (;;) {
+			resolved = malloc((size_t)need * sizeof(wchar_t));
+			if (!resolved) {
+				rc = ENOMEM;
+				break;
+			}
+			got = GetFullPathNameW(wname.mn_val, need, resolved, NULL);
+			if (!got) {
+				rc = ErrCode();
+				break;
+			}
+			if (got < need) {
+				target = resolved;
+				break;
+			}
+			free(resolved);
+			resolved = NULL;
+			need = got + 1;
+			if (need > 65536) {
+				/* pathological current directory; give up and keep
+				 * the pre-change behaviour */
+				rc = ERROR_FILENAME_EXCED_RANGE;
+				break;
+			}
+		}
+	}
+	if (rc == MDB_SUCCESS) {
+		h = CreateFileW(target, GENERIC_WRITE,
+			FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
+			NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+		if (h == INVALID_HANDLE_VALUE) {
+			rc = ErrCode();	/* before anything can clobber last-error */
+#ifdef MDB_DIRSYNC_PROBE
+			fprintf(stderr,
+				"DIRSYNC-PROBE dir=%s open_err=%lu flush_err=-1\n",
+				dir, (unsigned long)rc);
+#endif
+		} else {
+			DWORD flush_err = 0;
+			if (!FlushFileBuffers(h))
+				flush_err = ErrCode();
+			rc = (int)flush_err;
+#ifdef MDB_DIRSYNC_PROBE
+			{
+				wchar_t *fb;
+				DWORD fn = GetFinalPathNameByHandleW(h, NULL, 0, 0);
+				fb = fn ? malloc((size_t)fn * sizeof(wchar_t)) : NULL;
+				if (fb && GetFinalPathNameByHandleW(h, fb, fn, 0))
+					fprintf(stderr,
+						"DIRSYNC-PROBE dir=%s full=%ls "
+						"open_err=0 flush_err=%lu\n",
+						dir, fb, (unsigned long)flush_err);
+				else
+					fprintf(stderr,
+						"DIRSYNC-PROBE dir=%s open_err=0 "
+						"flush_err=%lu\n",
+						dir, (unsigned long)flush_err);
+				free(fb);
+			}
+#endif
+			CloseHandle(h);
+		}
+	}
+	root_err = mdb_wflushroot(target);
+#ifdef MDB_DIRSYNC_PROBE
+	fprintf(stderr, "DIRSYNC-PROBE-ROOT dir=%s root_err=%lu\n",
+		dir, (unsigned long)root_err);
+#endif
+	if (root_err == 0)
+		rc = MDB_SUCCESS;	/* the root flush is the durable one */
+	else if (rc == MDB_SUCCESS)
+		rc = (int)root_err;
+	free(resolved);
+	mdb_fname_destroy(wname);
+	if (rc == ERROR_ACCESS_DENIED || rc == ERROR_NOT_SUPPORTED ||
+		rc == ERROR_INVALID_FUNCTION || rc == ERROR_WRITE_PROTECT ||
+		rc == ERROR_FILENAME_EXCED_RANGE)
+		rc = MDB_SUCCESS;
+#else
+	int fd;
+	fd = open(dir, O_RDONLY);
+	if (fd < 0) {
+		rc = ErrCode();
+	} else {
+#ifdef __APPLE__
+		if (fcntl(fd, F_FULLFSYNC) != 0) {
+			if (errno == EINVAL || errno == ENOTSUP || errno == ENOSYS) {
+				/* Undocumented for directory descriptors; accept the
+				 * weaker fsync() guarantee there. */
+				if (fsync(fd) && errno != EINVAL && errno != ENOTSUP &&
+					errno != ENOSYS)
+					rc = ErrCode();
+			} else {
+				rc = ErrCode();
+			}
+		}
+#else
+		if (fsync(fd) && errno != EINVAL && errno != ENOTSUP &&
+			errno != ENOSYS)
+			rc = ErrCode();
+#endif
+		if (close(fd) < 0 && rc == MDB_SUCCESS)
+			rc = ErrCode();
+	}
+#ifdef MDB_DIRSYNC_PROBE
+	fprintf(stderr, "DIRSYNC-PROBE dir=%s open_err=0 flush_err=%d\n",
+		dir, rc);
+#endif
+	if (rc == EACCES || rc == EPERM || rc == EROFS || rc == EINVAL ||
+		rc == ENOTSUP || rc == ENOSYS)
+		rc = MDB_SUCCESS;
+#endif
+	return rc;
+}
+
+/** mdb_mdirsync() for the directory containing \b path (a file). */
+static int ESECT
+mdb_mdirsync_file(const char *path)
+{
+	char *dir = mdb_dirname(path);
+	int rc;
+	if (!dir)
+		return ENOMEM;
+	rc = mdb_mdirsync(dir);
+	free(dir);
+	return rc;
+}
+
 /** File type, access mode etc. for #mdb_fopen() */
 enum mdb_fopen_type {
 #ifdef _WIN32
@@ -6439,6 +6776,25 @@ mdb_env_open(MDB_env *env, const char *path, unsigned int flags, mdb_mode_t mode
 			} else {
 				rc = ENOMEM;
 			}
+		}
+		if (rc == MDB_SUCCESS &&
+			(!(flags & MDB_RDONLY) || !(flags & MDB_NOLOCK))) {
+			/* The data and lock files may have just been created; make
+			 * their directory entries durable too.  MDB_NOSYNC governs
+			 * transaction commits, not the one-off namespace change done
+			 * by opening (and possibly creating) the files.
+			 *
+			 * MDB_RDONLY does not mean "no files are written": a
+			 * read-only environment still creates or updates its lock
+			 * file (mdb_env_setup_locks() opens it O_CREAT /
+			 * OPEN_ALWAYS), so the directory entry of a newly created
+			 * lock file needs the same flush.  Only MDB_RDONLY with
+			 * MDB_NOLOCK is skipped, because then no file is touched at
+			 * all. */
+			if (flags & MDB_NOSUBDIR)
+				rc = mdb_mdirsync_file(env->me_path);
+			else
+				rc = mdb_mdirsync(env->me_path);
 		}
 	}
 
@@ -11812,6 +12168,20 @@ mdb_env_copy2(MDB_env *env, const char *path, unsigned int flags)
 	if (newfd != INVALID_HANDLE_VALUE)
 		if (close(newfd) < 0 && rc == MDB_SUCCESS)
 			rc = ErrCode();
+	if (rc == MDB_SUCCESS) {
+		/* The copy was just created inside `path` (it is `path` itself
+		 * with MDB_NOSUBDIR); make its directory entry durable too.
+		 * mdb_env_copyfd*() take a caller-owned fd and never see the
+		 * pathname, so they are not covered.  Note on POSIX the copy fd
+		 * itself is not fsynced by mdb_env_copy*() either -- completing
+		 * that is deliberately out of scope here; on Windows the copy fd
+		 * is NO_BUFFERING|WRITE_THROUGH already, so this directory flush
+		 * is the missing last step there. */
+		if (F_ISSET(env->me_flags, MDB_NOSUBDIR))
+			rc = mdb_mdirsync_file(path);
+		else
+			rc = mdb_mdirsync(path);
+	}
 	return rc;
 }
 
