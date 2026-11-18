@@ -5495,6 +5495,7 @@ mdb_dirname(const char *path)
  * Actions runners, real Windows 10/11) it opens and flushes without
  * elevation.
  */
+#ifdef _WIN32
 /** Flush the volume root ("X:\\") of a resolved absolute wide path.
  * On NTFS this is the flush that persists namespace metadata: the
  * subdirectory flush issues the same flush IRP but writes no metadata
@@ -5530,6 +5531,7 @@ mdb_wflushroot(const wchar_t *target)
 	CloseHandle(h);
 	return err;
 }
+#endif /* _WIN32 */
 
 static int ESECT
 mdb_mdirsync(const char *dir)
