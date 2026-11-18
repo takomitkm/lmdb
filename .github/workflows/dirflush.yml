@@ -45,7 +45,7 @@ jobs:
         run: |
           set -e
           cd libraries/liblmdb
-          mkdir -p /d/dirt/nosub
+          mkdir -p /d/dirt/a /d/dirt/b /d/dirt/c /d/dirt/d /d/dirt/e /d/dirt/f /d/dirt/nosub
           ./dirsync.exe /d/dirt/a /d/dirt/b normal
           ./dirsync.exe /d/dirt/c /d/dirt/d nosubdir
           ./dirsync.exe /d/dirt/e /d/dirt/f nosync
@@ -55,7 +55,7 @@ jobs:
         run: |
           set -e
           cd libraries/liblmdb
-          mkdir -p /d/dirt/probe
+          mkdir -p /d/dirt/probe/a /d/dirt/probe/b
           ./dirsync-probe.exe /d/dirt/probe/a /d/dirt/probe/b normal 2> probe.out || true
           cat probe.out
           nd=$(grep -c 'DIRSYNC-PROBE dir=.*open_err=0 flush_err=0' probe.out || true)
@@ -68,7 +68,7 @@ jobs:
           set -e
           cd libraries/liblmdb
           gcc -O2 -I. -DMDB_DIRSYNC_PROBE -o dirsync-base.exe dirsync-test.c mdb-base.c midl.c
-          mkdir -p /d/dirt/red
+          mkdir -p /d/dirt/red/a /d/dirt/red/b
           ./dirsync-base.exe /d/dirt/red/a /d/dirt/red/b normal 2> red.out || true
           cat red.out
           n=$(grep -c 'DIRSYNC-PROBE' red.out || true)
@@ -130,7 +130,7 @@ jobs:
           cd libraries/liblmdb
           sudo apt-get update -qq
           sudo apt-get install -y strace
-          mkdir -p /tmp/dirt/g
+          mkdir -p /tmp/dirt/g/a /tmp/dirt/g/b
           strace -f -e trace=fsync,fdatasync,openat ./dirsync-linux /tmp/dirt/g/a /tmp/dirt/g/b >/dev/null 2> strace.out || true
           echo "--- directory fsyncs (openat with O_DIRECTORY, then fsync):"
           grep -E 'fsync\(' strace.out | head -5
