@@ -24,6 +24,7 @@ jobs:
           gcc -O2 -I. -DMDB_DIRSYNC_PROBE -o dirsync-probe.exe dirsync-test.c mdb.c midl.c
           gcc -O2 -I. -o race.exe race-test.c mdb.c midl.c
           gcc -O2 -I. -o bench-dirroot.exe e25_lmdb_bench.c mdb.c midl.c
+          gcc -O2 -I. -o dirname-dirroot.exe dirname-test.c midl.c
           cp mdb-base.c mdb.c
           gcc -O2 -I. -o dirname-base.exe dirname-test.c midl.c 2>/dev/null \
             || echo "pristine mdb.c has no mdb_dirname (expected; unit test is patched-only)"
@@ -127,7 +128,8 @@ jobs:
         run: |
           set -e
           cd libraries/liblmdb
-          sudo apt-get install -y strace >/dev/null 2>&1 || true
+          sudo apt-get update -qq
+          sudo apt-get install -y strace
           mkdir -p /tmp/dirt/g
           strace -f -e trace=fsync,fdatasync,openat ./dirsync-linux /tmp/dirt/g/a /tmp/dirt/g/b >/dev/null 2> strace.out || true
           echo "--- directory fsyncs (openat with O_DIRECTORY, then fsync):"
