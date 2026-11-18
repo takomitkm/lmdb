@@ -84,6 +84,7 @@ jobs:
       - name: bench - env creation + commit cost, three variants (3 rounds)
         run: |
           cd libraries/liblmdb
+          mkdir -p /d/dirt/bench
           for r in 1 2 3; do
             ./bench-base.exe /d/dirt/bench 100 2000 base
             ./bench-dir.exe /d/dirt/bench 100 2000 dir
