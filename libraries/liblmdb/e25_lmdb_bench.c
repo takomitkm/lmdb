@@ -48,7 +48,7 @@ static void die(const char *what, int rc)
 int main(int argc, char **argv)
 {
 	const char *root, *label;
-	char path[1024], sub[1024];
+	char path[1024], sub[1024], kbuf[8];
 	MDB_env *env;
 	MDB_dbi dbi;
 	MDB_txn *txn;
@@ -67,7 +67,8 @@ int main(int argc, char **argv)
 	label = argc > 4 ? argv[4] : "x";
 
 	key.mv_size = 4;
-	key.mv_data = "user";
+	key.mv_data = kbuf;
+	memcpy(kbuf, "user", 4);
 	data.mv_size = 5;
 	data.mv_data = "hello";
 
@@ -111,7 +112,7 @@ int main(int argc, char **argv)
 
 	t2 = now_ms();
 	for (i = 0; i < nTxn; i++) {
-		snprintf((char *)key.mv_data, key.mv_size, "k%04d", i & 9999);
+		snprintf(kbuf, sizeof kbuf, "k%04d", i & 9999);
 		if ((rc = mdb_txn_begin(env, NULL, 0, &txn)) != MDB_SUCCESS)
 			die("txn_begin", rc);
 		if ((rc = mdb_put(txn, dbi, &key, &data, 0)) != MDB_SUCCESS)

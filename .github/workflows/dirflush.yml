@@ -45,7 +45,7 @@ jobs:
         run: |
           set -e
           cd libraries/liblmdb
-          mkdir -p /d/dirt/a /d/dirt/b /d/dirt/c /d/dirt/d /d/dirt/e /d/dirt/f /d/dirt/nosub
+          mkdir -p /d/dirt/a /d/dirt/b /d/dirt/e /d/dirt/f /d/dirt/nosub
           ./dirsync.exe /d/dirt/a /d/dirt/b normal
           ./dirsync.exe /d/dirt/c /d/dirt/d nosubdir
           ./dirsync.exe /d/dirt/e /d/dirt/f nosync
